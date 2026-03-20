@@ -159,6 +159,8 @@ jobs:
           git clone --depth=1 \
             https://chromium.googlesource.com/chromium/tools/depot_tools.git \
             "$GITHUB_WORKSPACE/depot_tools"
+          # Bootstrap depot_tools so python3_bin_reldir.txt and friends are created
+          "$GITHUB_WORKSPACE/depot_tools/update_depot_tools"
           # Symlink so anything that hard-codes /home/runner/depot_tools still works
           ln -sfn "$GITHUB_WORKSPACE/depot_tools" /home/runner/depot_tools || true
           echo "$GITHUB_WORKSPACE/depot_tools" >> "$GITHUB_PATH"
