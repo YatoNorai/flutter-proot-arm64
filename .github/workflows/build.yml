@@ -148,8 +148,21 @@ jobs:
         run: pip install -r requirements.txt
 
       # ── 5. depot_tools ───────────────────────────────────────────────────────
-      - name: Setup depot_tools
-        uses: newkdev/setup-depot-tools@v1.0.1
+      #    The newkdev action clones into /home/runner/depot_tools which sits on
+      #    the original small root disk (~14 GB, already mostly consumed by the
+      #    runner itself).  We clone manually into $GITHUB_WORKSPACE instead —
+      #    that directory lives on the large LVM volume created by
+      #    maximize-build-space.  A symlink keeps any tool that hard-codes the
+      #    old path happy.
+      - name: Setup depot_tools (manual, onto expanded disk)
+        run: |
+          git clone --depth=1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$GITHUB_WORKSPACE/depot_tools"
+          # Symlink so anything that hard-codes /home/runner/depot_tools still works
+          ln -sfn "$GITHUB_WORKSPACE/depot_tools" /home/runner/depot_tools || true
+          echo "$GITHUB_WORKSPACE/depot_tools" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/depot_tools/python-bin" >> "$GITHUB_PATH"
 
       # ── 6. Cache engine deps ─────────────────────────────────────────────────
       #    Key includes the runtime so each job restores its own slice of cache.
