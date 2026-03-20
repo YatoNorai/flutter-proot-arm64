@@ -226,7 +226,63 @@ jobs:
           echo "=== Disk after sysroot install ==="
           df -h
 
-      # ── 13. Build each runtime individually: GN → ninja → assemble → rm out/ ─
+      # ── 13. Set PKG_CONFIG env vars for ARM64 cross-compilation ─────────────
+      # The Chromium pkg-config.py script (called by GN) uses PKG_CONFIG_LIBDIR
+      # and PKG_CONFIG_SYSROOT_DIR to find .pc files for the target arch.
+      # Without these, it searches the host x86_64 paths and fails to find
+      # arm64 packages like x11, gtk3, etc — even though they exist in the sysroot.
+      - name: Export PKG_CONFIG env for sysroot
+        run: |
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+
+          # Find the sysroot path (mirrors _find_sysroot logic in build.py)
+          SYSROOT=""
+          ENGINE_LINUX="flutter/engine/src/build/linux"
+          for NAME in "debian_bullseye_${ARCH}-sysroot" "debian_bookworm_${ARCH}-sysroot"; do
+            CANDIDATE="$ENGINE_LINUX/$NAME"
+            if [ -d "$CANDIDATE" ] && [ "$(ls -A $CANDIDATE 2>/dev/null)" ]; then
+              SYSROOT="$(realpath $CANDIDATE)"
+              break
+            fi
+          done
+          # Fallback sysroot
+          if [ -z "$SYSROOT" ] && [ -d "sysroot/$ARCH" ] && [ "$(ls -A sysroot/$ARCH 2>/dev/null)" ]; then
+            SYSROOT="$(realpath sysroot/$ARCH)"
+          fi
+
+          if [ -z "$SYSROOT" ]; then
+            echo "ERROR: sysroot not found for $ARCH"
+            exit 1
+          fi
+
+          echo "Using sysroot: $SYSROOT"
+
+          # GNU triplet for the target arch
+          case "$ARCH" in
+            arm64) TRIPLET="aarch64-linux-gnu" ;;
+            arm)   TRIPLET="arm-linux-gnueabihf" ;;
+            *)     TRIPLET="$ARCH-linux-gnu" ;;
+          esac
+
+          # PKG_CONFIG_SYSROOT_DIR: pkg-config prepends this to every path in .pc files
+          # PKG_CONFIG_LIBDIR:      replaces the default search path entirely
+          #   (use LIBDIR not PATH so host paths are not mixed in)
+          PKG_LIBDIR="${SYSROOT}/usr/lib/${TRIPLET}/pkgconfig"
+          PKG_LIBDIR="${PKG_LIBDIR}:${SYSROOT}/usr/lib/pkgconfig"
+          PKG_LIBDIR="${PKG_LIBDIR}:${SYSROOT}/usr/share/pkgconfig"
+
+          echo "PKG_CONFIG_SYSROOT_DIR=$SYSROOT"  >> $GITHUB_ENV
+          echo "PKG_CONFIG_LIBDIR=$PKG_LIBDIR"     >> $GITHUB_ENV
+
+          echo "PKG_CONFIG_SYSROOT_DIR=$SYSROOT"
+          echo "PKG_CONFIG_LIBDIR=$PKG_LIBDIR"
+
+          # Verify x11.pc is reachable
+          echo "--- Checking x11.pc ---"
+          find "$SYSROOT" -name "x11.pc" 2>/dev/null || echo "WARNING: x11.pc not found in sysroot!"
+          find "$SYSROOT" -name "gtk+-3.0.pc" 2>/dev/null || echo "WARNING: gtk+-3.0.pc not found in sysroot!"
+
+      # ── 14. Build each runtime individually: GN → ninja → assemble → rm out/ ─
       # Building all runtimes at once keeps every out/linux_{mode}_arm64 on
       # disk simultaneously (15-25 GB each). Instead, build one at a time and
       # delete the out/ tree immediately after assembling the artifacts.
