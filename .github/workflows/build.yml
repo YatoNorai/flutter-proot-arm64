@@ -18,9 +18,9 @@ on:
           - arm64
           - arm
       runtimes:
-        description: "Build runtimes (comma-separated)"
+        description: "Build runtimes (comma-separated). Tip: use only 'release' to save ~40 GB of disk."
         required: false
-        default: "debug,release,profile"
+        default: "release"
       lto:
         description: "Enable Link-Time Optimization (smaller binary, longer build)"
         required: false
@@ -32,109 +32,63 @@ env:
   PUB_HOSTED_URL: "https://pub.dartlang.org"
 
 jobs:
-  # ── Resolve version once so all matrix jobs share the same value ────────────
-  resolve:
-    name: Resolve Flutter version
-    runs-on: ubuntu-latest
-    outputs:
-      flutter_version: ${{ steps.version.outputs.FLUTTER_VERSION }}
-      runtimes_matrix: ${{ steps.matrix.outputs.RUNTIMES_MATRIX }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Python requirements
-        run: pip install -r requirements.txt
-
-      - name: Resolve Flutter version
-        id: version
-        run: |
-          INPUT="${{ github.event.inputs.flutter_version }}"
-          VERSION=$(python3 build.py resolve_version --version="$INPUT")
-          echo "FLUTTER_VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Resolved Flutter version: $VERSION"
-
-      # Turn "debug,release,profile" into a JSON array for the matrix
-      - name: Build runtimes matrix
-        id: matrix
-        run: |
-          RUNTIMES="${{ github.event.inputs.runtimes || 'debug,release,profile' }}"
-          JSON=$(python3 -c "
-          import json, sys
-          runtimes = [r.strip() for r in '$RUNTIMES'.split(',') if r.strip()]
-          print(json.dumps(runtimes))
-          ")
-          echo "RUNTIMES_MATRIX=$JSON" >> $GITHUB_OUTPUT
-          echo "Matrix: $JSON"
-
-  # ── One job per runtime to avoid disk exhaustion ────────────────────────────
   build:
-    name: Build (${{ matrix.runtime }})
-    needs: resolve
+    name: Build Flutter ARM64 for proot
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: ${{ fromJson(needs.resolve.outputs.runtimes_matrix) }}
-
     steps:
-      # ── 0. Aggressive pre-cleanup (must run BEFORE maximize-build-space) ────
-      #    These directories are not needed for a Flutter engine build and each
-      #    takes several GB.  Doing this before the action ensures the freed
-      #    space is included in the merged volume.
-      - name: Free disk space (pre-maximize)
-        run: |
-          echo "=== Disk before cleanup ==="
-          df -h
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/local/share/powershell \
-            /usr/local/share/chromium \
-            /usr/share/dotnet \
-            /usr/share/swift \
-            /opt/ghc \
-            /opt/hostedtoolcache/CodeQL \
-            /opt/hostedtoolcache/go \
-            /opt/hostedtoolcache/PyPy \
-            /opt/hostedtoolcache/node \
-            /opt/hostedtoolcache/Ruby \
-            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk \
-            "$AGENT_TOOLSDIRECTORY" || true
-          sudo apt-get clean
-          sudo docker image prune --all --force || true
-          echo "=== Disk after cleanup ==="
-          df -h
-
-      # ── 1. Maximize disk space ───────────────────────────────────────────────
+      # ── 1. Maximize disk space ──────────────────────────────────────────────
+      # Mounts extra space at /mnt and symlinks the engine out/ dir there so
+      # ninja intermediate objects never land on the root partition.
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 8192      # keep 8 GB for the runner itself
-          swap-size-mb: 4096
+          root-reserve-mb: 8192        # keep 8 GB for OS + apt + tools
+          swap-size-mb: 4096           # extra swap prevents OOM during link
           remove-dotnet: "true"
           remove-haskell: "true"
           remove-android: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
+          build-mount-path: "/mnt/build"
 
-      - name: Show disk after maximize
-        run: df -h
+      # ── 2. Extra cleanup (things maximize-build-space misses) ───────────────
+      - name: Extra disk cleanup
+        run: |
+          # Stop and purge Docker daemon (images already removed above, but
+          # the daemon itself + overlay dirs can hold a few extra GB)
+          sudo systemctl stop docker || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd
 
-      # ── 2. Checkout ──────────────────────────────────────────────────────────
+          # Purge large pre-installed tool suites we don't need
+          sudo apt-get purge -y \
+            '^llvm-.*' '^libllvm.*' '^php.*' '^mongodb.*' '^mysql.*' \
+            '^postgresql.*' azure-cli google-cloud-sdk google-chrome-stable \
+            firefox powershell snapd || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /var/cache/apt/archives \
+            /tmp/*
+
+          echo "=== Disk after extra cleanup ==="
+          df -h
+
+      # ── 3. Checkout this repo ───────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 3. System dependencies ───────────────────────────────────────────────
+      # ── 4. System dependencies ──────────────────────────────────────────────
       - name: Install system dependencies
-        timeout-minutes: 10
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo -E apt-get update -qq
-          sudo -E apt-get install -y --no-install-recommends \
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
             git curl wget ca-certificates \
             ninja-build \
             libfreetype-dev \
@@ -146,33 +100,26 @@ jobs:
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu
 
-      # ── 4. Python dependencies ───────────────────────────────────────────────
+      # ── 5. Python dependencies ──────────────────────────────────────────────
       - name: Install Python requirements
         run: pip install -r requirements.txt
 
-      # ── 5. depot_tools ───────────────────────────────────────────────────────
-      #    The newkdev action clones into /home/runner/depot_tools which sits on
-      #    the original small root disk (~14 GB, already mostly consumed by the
-      #    runner itself).  We clone manually into $GITHUB_WORKSPACE instead —
-      #    that directory lives on the large LVM volume created by
-      #    maximize-build-space.  A symlink keeps any tool that hard-codes the
-      #    old path happy.
-      - name: Setup depot_tools (manual, onto expanded disk)
-        run: |
-          git clone --depth=1 \
-            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-            "$GITHUB_WORKSPACE/depot_tools"
-          # Bootstrap depot_tools so python3_bin_reldir.txt and friends are created
-          "$GITHUB_WORKSPACE/depot_tools/update_depot_tools"
-          # Symlink so anything that hard-codes /home/runner/depot_tools still works
-          ln -sfn "$GITHUB_WORKSPACE/depot_tools" /home/runner/depot_tools || true
-          echo "$GITHUB_WORKSPACE/depot_tools" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/depot_tools/python-bin" >> "$GITHUB_PATH"
+      # ── 6. Setup depot_tools ────────────────────────────────────────────────
+      - name: Setup depot_tools
+        uses: newkdev/setup-depot-tools@v1.0.1
 
-      # ── 6. Cache engine deps ─────────────────────────────────────────────────
-      #    Key includes the runtime so each job restores its own slice of cache.
-      #    Shared engine source is stored under a common prefix so cache can be
-      #    reused across runtimes when only the compiled output differs.
+      # ── 7. Resolve Flutter version ──────────────────────────────────────────
+      - name: Resolve Flutter version
+        id: version
+        run: |
+          INPUT="${{ github.event.inputs.flutter_version }}"
+          VERSION=$(python3 build.py resolve_version --version="$INPUT")
+          echo "FLUTTER_VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved Flutter version: $VERSION"
+
+      # ── 8. Cache gclient dependencies ───────────────────────────────────────
+      # NOTE: The cache key includes the Flutter version so a version bump
+      # automatically invalidates stale engine deps.
       - name: Cache engine deps (gclient)
         id: cache-engine
         uses: actions/cache@v4
@@ -180,131 +127,154 @@ jobs:
           path: |
             flutter/engine
             flutter/.pub-preload-cache
-          key: engine-${{ needs.resolve.outputs.flutter_version }}-${{ runner.os }}-${{ matrix.runtime }}
+          key: engine-${{ steps.version.outputs.FLUTTER_VERSION }}-${{ runner.os }}
           restore-keys: |
-            engine-${{ needs.resolve.outputs.flutter_version }}-${{ runner.os }}-
-            engine-${{ needs.resolve.outputs.flutter_version }}-
+            engine-${{ steps.version.outputs.FLUTTER_VERSION }}-
 
-      # ── 7. Clone Flutter SDK ─────────────────────────────────────────────────
+      # ── 9. Clone Flutter SDK ─────────────────────────────────────────────────
       - name: Clone Flutter
         run: |
           python3 build.py clone \
-            --version="${{ needs.resolve.outputs.flutter_version }}"
+            --version="${{ steps.version.outputs.FLUTTER_VERSION }}"
 
-      # ── 8. gclient sync ──────────────────────────────────────────────────────
+      # ── 10. gclient sync (fetch engine, Dart, deps) ──────────────────────────
       - name: Sync engine dependencies (gclient)
         if: steps.cache-engine.outputs.cache-hit != 'true'
-        run: python3 build.py sync
+        run: |
+          python3 build.py sync
 
-      # ── 9. ARM64 sysroot ─────────────────────────────────────────────────────
+          # gclient leaves behind large .git history in third-party deps that
+          # we won't need to diff/log — strip it to reclaim ~2-4 GB.
+          echo "Stripping .git dirs from third-party deps..."
+          find flutter/engine/src/third_party -maxdepth 3 -name ".git" \
+            -exec rm -rf {} + 2>/dev/null || true
+          find flutter/engine/src/flutter/third_party -maxdepth 3 -name ".git" \
+            -exec rm -rf {} + 2>/dev/null || true
+
+          echo "=== Disk after gclient sync ==="
+          df -h
+
+      # ── 11. Install ARM64 sysroot ─────────────────────────────────────────────
       - name: Install ARM64 sysroot
         run: |
           python3 build.py install_sysroot \
             --arch="${{ github.event.inputs.arch || 'arm64' }}"
 
-      # ── 10. Disk check ───────────────────────────────────────────────────────
+      # ── 12. Symlink engine out/ to /mnt/build ─────────────────────────────────
+      # Ninja writes all object files and intermediates into engine/src/out/.
+      # By symlinking it onto the large /mnt/build partition we keep the root
+      # filesystem from filling up.
+      - name: Symlink engine out/ → /mnt/build/out
+        run: |
+          mkdir -p /mnt/build/out
+          mkdir -p flutter/engine/src
+          # Remove any existing out dir (e.g. from a restored cache)
+          rm -rf flutter/engine/src/out
+          ln -s /mnt/build/out flutter/engine/src/out
+          echo "Symlink created: flutter/engine/src/out → /mnt/build/out"
+          df -h
+
+      # ── 13. Check disk space before build ─────────────────────────────────────
       - name: Check disk space before build
         run: df -h
 
-      # ── 11. Configure (GN) ───────────────────────────────────────────────────
-      - name: Configure build (GN)
+      # ── 14. Build each runtime individually (GN → ninja → assemble → clean) ───
+      # Building all runtimes at once leaves every out/linux_{mode}_{arch}
+      # directory on disk simultaneously, which can exceed 60 GB.
+      # Instead we build one runtime at a time and delete its out/ tree as
+      # soon as the artifacts have been assembled into the Flutter SDK cache.
+      - name: Build engine + Dart SDK (per-runtime)
         run: |
-          python3 build.py configure \
-            --arch="${{ github.event.inputs.arch || 'arm64' }}" \
-            --runtimes="${{ matrix.runtime }}" \
-            --lto="${{ github.event.inputs.lto || 'false' }}"
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          RUNTIMES="${{ github.event.inputs.runtimes || 'release' }}"
+          LTO="${{ github.event.inputs.lto || 'false' }}"
 
-      # ── 12. Build (ninja) ────────────────────────────────────────────────────
-      - name: Build engine + Dart SDK (ninja) — ${{ matrix.runtime }}
-        run: |
-          python3 build.py build \
-            --arch="${{ github.event.inputs.arch || 'arm64' }}" \
-            --runtimes="${{ matrix.runtime }}"
+          IFS=',' read -ra MODES <<< "$RUNTIMES"
+          for MODE in "${MODES[@]}"; do
+            MODE="$(echo "$MODE" | xargs)"   # trim whitespace
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  Configuring  : $MODE ($ARCH)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            python3 build.py configure \
+              --arch="$ARCH" \
+              --runtimes="$MODE" \
+              --lto="$LTO"
 
-      # ── 13. Prune object files to reclaim disk before assemble/package ───────
-      #    The .o/.a files are only needed during linking.  Once ninja finishes
-      #    they are dead weight — often 10-30 GB for a single runtime.
-      - name: Prune build object files
-        run: |
-          echo "=== Disk before prune ==="
-          df -h
-          # Remove intermediate object files from the ninja output dirs.
-          # Adjust the glob if build.py places them elsewhere.
-          find flutter/engine/src/out -type f \( -name "*.o" -o -name "*.a" \) -delete 2>/dev/null || true
-          echo "=== Disk after prune ==="
-          df -h
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  Building     : $MODE ($ARCH)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            python3 build.py build \
+              --arch="$ARCH" \
+              --runtimes="$MODE"
 
-      # ── 14. Assemble SDK ─────────────────────────────────────────────────────
-      - name: Assemble Flutter SDK and create stamps
-        run: |
-          python3 build.py assemble \
-            --arch="${{ github.event.inputs.arch || 'arm64' }}" \
-            --runtimes="${{ matrix.runtime }}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  Assembling   : $MODE ($ARCH)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            python3 build.py assemble \
+              --arch="$ARCH" \
+              --runtimes="$MODE"
 
-      # ── 15. Package ──────────────────────────────────────────────────────────
-      - name: Package Flutter SDK (${{ matrix.runtime }})
+            # ── KEY FIX: delete the out/ subdirectory for this runtime ──────
+            # This frees 15-25 GB of object files before the next runtime
+            # starts, preventing "No space left on device" errors.
+            OUT_DIR="flutter/engine/src/out/linux_${MODE}_${ARCH}"
+            echo "Cleaning up build intermediates: $OUT_DIR"
+            rm -rf "$OUT_DIR"
+
+            echo "=== Disk after $MODE cleanup ==="
+            df -h
+          done
+
+      # ── 15. Package ───────────────────────────────────────────────────────────
+      - name: Package Flutter SDK
         id: package
         run: |
           ARCH="${{ github.event.inputs.arch || 'arm64' }}"
-          VERSION="${{ needs.resolve.outputs.flutter_version }}"
+          VERSION="${{ steps.version.outputs.FLUTTER_VERSION }}"
           python3 build.py package \
             --arch="$ARCH" \
-            --version="$VERSION" \
-            --runtimes="${{ matrix.runtime }}"
-          PKG_NAME="flutter-${VERSION}-linux-${ARCH}-${{ matrix.runtime }}.tar.gz"
+            --version="$VERSION"
+
+          PKG_NAME="flutter-${VERSION}-linux-${ARCH}-proot.tar.gz"
           echo "PACKAGE_NAME=$PKG_NAME" >> $GITHUB_OUTPUT
 
+      # ── 16. Check disk usage after build ──────────────────────────────────────
       - name: Check disk space after build
         run: df -h
 
-      # ── 16. Upload per-runtime artifact ──────────────────────────────────────
-      - name: Upload SDK artifact (${{ matrix.runtime }})
+      # ── 17. Upload artifact (for inspection) ──────────────────────────────────
+      - name: Upload SDK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-sdk-${{ needs.resolve.outputs.flutter_version }}-${{ github.event.inputs.arch || 'arm64' }}-${{ matrix.runtime }}
+          name: flutter-sdk-${{ steps.version.outputs.FLUTTER_VERSION }}-${{ github.event.inputs.arch || 'arm64' }}
           path: "*.tar.gz"
           compression-level: 0
           retention-days: 7
 
-  # ── Merge all runtime artifacts into one GitHub Release ─────────────────────
-  release:
-    name: Create GitHub Release
-    needs: [resolve, build]
-    runs-on: ubuntu-latest
-    if: always() && needs.build.result != 'cancelled'
-
-    steps:
-      - name: Download all runtime artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: flutter-sdk-${{ needs.resolve.outputs.flutter_version }}-${{ github.event.inputs.arch || 'arm64' }}-*
-          merge-multiple: true
-
-      - name: List downloaded files
-        run: ls -lh *.tar.gz
-
+      # ── 18. Create GitHub release ─────────────────────────────────────────────
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "flutter-${{ needs.resolve.outputs.flutter_version }}-${{ github.event.inputs.arch || 'arm64' }}"
-          name: "Flutter ${{ needs.resolve.outputs.flutter_version }} (Linux ${{ github.event.inputs.arch || 'arm64' }} / proot)"
+          tag_name: "flutter-${{ steps.version.outputs.FLUTTER_VERSION }}-${{ github.event.inputs.arch || 'arm64' }}"
+          name: "Flutter ${{ steps.version.outputs.FLUTTER_VERSION }} (Linux ${{ github.event.inputs.arch || 'arm64' }} / proot)"
           body: |
             ## Flutter SDK for proot ARM64
 
-            **Flutter version:** `${{ needs.resolve.outputs.flutter_version }}`
-            **Target arch:** `${{ github.event.inputs.arch || 'arm64' }}`
-            **Runtimes:** `${{ github.event.inputs.runtimes || 'debug,release,profile' }}`
+            **Flutter version:** `${{ steps.version.outputs.FLUTTER_VERSION }}`  
+            **Target arch:** `${{ github.event.inputs.arch || 'arm64' }}`  
+            **Runtimes:** `${{ github.event.inputs.runtimes || 'release' }}`
 
             ### Installation (inside proot)
 
             ```bash
-            # 1. Extract the SDK (choose the runtime you need)
-            tar -xzf flutter-<version>-linux-arm64-release.tar.gz -C /opt
+            # 1. Extract the SDK
+            tar -xzf ${{ steps.package.outputs.PACKAGE_NAME }} -C /opt
 
             # 2. Run the install script
             bash /opt/flutter/flutter-proot-install.sh
 
-            # 3. Add to PATH
+            # 3. Add to PATH (add to ~/.bashrc or ~/.zshrc)
             export PATH="$PATH:/opt/flutter/bin"
 
             # 4. Verify
