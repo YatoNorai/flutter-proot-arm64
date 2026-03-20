@@ -124,8 +124,15 @@ jobs:
         run: pip install -r requirements.txt
 
       # ── 7. Setup depot_tools ────────────────────────────────────────────────
+      # The newkdev/setup-depot-tools action uses PowerShell (pwsh) internally,
+      # which is not available on ubuntu-latest. Install manually via bash.
       - name: Setup depot_tools
-        uses: newkdev/setup-depot-tools@v1.0.1
+        run: |
+          git clone --depth=1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            /mnt/build/depot_tools
+          echo "/mnt/build/depot_tools" >> $GITHUB_PATH
+          echo "DEPOT_TOOLS=/mnt/build/depot_tools" >> $GITHUB_ENV
 
       # ── 8. Resolve Flutter version ──────────────────────────────────────────
       - name: Resolve Flutter version
