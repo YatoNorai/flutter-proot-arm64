@@ -55,27 +55,48 @@ jobs:
           build-mount-path: "/mnt/build"
 
       # ── 2. Aggressive pre-build cleanup ────────────────────────────────────
+      # IMPORTANT: apt-get needs free space to write /var/lib/apt/lists/.
+      # We MUST free disk with rm -rf FIRST, before any apt command.
       - name: Extra disk cleanup
         run: |
-          sudo systemctl stop docker || true
-          sudo rm -rf /var/lib/docker /var/lib/containerd
-
-          sudo apt-get purge -y \
-            '^llvm-.*' '^libllvm.*' '^php.*' '^mongodb.*' '^mysql.*' \
-            '^postgresql.*' azure-cli google-cloud-sdk google-chrome-stable \
-            firefox powershell snapd || true
-          sudo apt-get autoremove -y --purge
-          sudo apt-get clean
+          # ── Phase 1: raw deletes (no apt needed, frees space immediately) ──
+          sudo systemctl stop docker.socket docker.service || true
           sudo rm -rf \
+            /var/lib/docker \
+            /var/lib/containerd \
+            /var/lib/apt/lists/* \
+            /var/cache/apt/archives \
             /usr/share/dotnet \
             /usr/local/lib/android \
             /opt/ghc \
-            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache \
             /usr/local/share/boost \
-            /var/cache/apt/archives \
+            /usr/share/swift \
+            /usr/local/julia* \
+            /usr/share/kotlinc \
+            /usr/local/lib/node_modules \
+            /usr/lib/google-cloud-sdk \
+            /usr/lib/jvm \
+            /usr/share/gradle* \
+            /usr/share/miniconda \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
             /tmp/*
 
-          echo "=== Disk after extra cleanup ==="
+          echo "=== Disk after phase-1 rm cleanup ==="
+          df -h
+
+          # ── Phase 2: apt purge (now there is space to write lists) ──────────
+          sudo apt-get update -qq 2>/dev/null || true
+          sudo apt-get purge -y --auto-remove \
+            '^llvm-.*' '^libllvm.*' '^php.*' '^mongodb.*' '^mysql.*' \
+            '^postgresql.*' '^dotnet-.*' '^aspnetcore-.*' \
+            azure-cli google-chrome-stable firefox powershell snapd \
+            google-cloud-cli || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "=== Disk after phase-2 apt cleanup ==="
           df -h
 
       # ── 3. Checkout this repo ───────────────────────────────────────────────
