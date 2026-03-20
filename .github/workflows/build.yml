@@ -103,7 +103,20 @@ jobs:
           echo "=== Disk after redirect ==="
           df -h
 
-      # ── 5. System dependencies ──────────────────────────────────────────────
+      # ── 5. Patch build.py ──────────────────────────────────────────────────
+      # _current_tag() only catches GitCommandError, but when the flutter/
+      # symlink target exists as an empty dir, git.Repo() raises
+      # InvalidGitRepositoryError — which is not caught, crashing clone.
+      # Patch it so an empty dir is treated as "not yet cloned" (returns None).
+      - name: Patch build.py (_current_tag exception handling)
+        run: |
+          sed -i \
+            's/except git\.exc\.GitCommandError:/except (git.exc.GitCommandError, git.exc.InvalidGitRepositoryError):/' \
+            build.py
+          echo "Patch applied:"
+          grep -n "except.*GitCommandError\|except.*InvalidGit" build.py
+
+      # ── 6. System dependencies ──────────────────────────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
