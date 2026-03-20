@@ -1,0 +1,28 @@
+# Flutter SDK checkout (managed by build.py)
+flutter/
+flutter.old/
+
+# Sysroot (generated at build time)
+sysroot/
+
+# Build outputs
+*.tar.gz
+*.zip
+*.deb
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

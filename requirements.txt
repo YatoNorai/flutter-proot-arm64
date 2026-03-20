@@ -1,0 +1,7 @@
+# flutter-proot-arm64 — Python dependencies
+aiohttp==3.11.14       # async HTTP (for sysroot package downloads)
+fire==0.7.0            # CLI interface for build.py
+loguru==0.7.3          # structured logging
+GitPython==3.1.44      # git operations (clone, tag detection)
+requests==2.32.3       # HTTP (version resolution from Flutter releases API)
+tomli>=2.0.0; python_version < "3.11"   # TOML parser (stdlib in Python 3.11+)

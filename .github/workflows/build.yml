@@ -1,0 +1,214 @@
+name: Build Flutter SDK for proot (ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: >
+          Flutter version or channel: "stable", "beta", "main", or a tag like "3.29.2".
+          Leave empty to use config.toml default.
+        required: false
+        default: ""
+      arch:
+        description: "Target architecture"
+        required: false
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - arm
+      runtimes:
+        description: "Build runtimes (comma-separated)"
+        required: false
+        default: "debug,release,profile"
+      lto:
+        description: "Enable Link-Time Optimization (smaller binary, longer build)"
+        required: false
+        default: "false"
+        type: boolean
+
+env:
+  # Prevent Flutter from downloading pre-built artifacts during setup checks
+  FLUTTER_STORAGE_BASE_URL: "https://storage.googleapis.com"
+  PUB_HOSTED_URL: "https://pub.dartlang.org"
+
+jobs:
+  build:
+    name: Build Flutter ARM64 for proot
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ── 1. Maximize disk space ──────────────────────────────────────────────
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 4096
+          swap-size-mb: 2048
+          remove-dotnet: "true"
+          remove-haskell: "true"
+          remove-android: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      # ── 2. Checkout this repo ───────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 3. System dependencies ──────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget ca-certificates \
+            ninja-build \
+            libfreetype-dev \
+            python3 python3-pip \
+            dpkg \
+            patchelf \
+            pkg-config \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
+
+      # ── 4. Python dependencies ──────────────────────────────────────────────
+      - name: Install Python requirements
+        run: pip install -r requirements.txt
+
+      # ── 5. Setup depot_tools ────────────────────────────────────────────────
+      - name: Setup depot_tools
+        uses: newkdev/setup-depot-tools@v1.0.1
+
+      # ── 6. Resolve Flutter version ──────────────────────────────────────────
+      - name: Resolve Flutter version
+        id: version
+        run: |
+          INPUT="${{ github.event.inputs.flutter_version }}"
+          VERSION=$(python3 build.py resolve_version --version="$INPUT")
+          echo "FLUTTER_VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved Flutter version: $VERSION"
+
+      # ── 7. Cache gclient dependencies ───────────────────────────────────────
+      - name: Cache engine deps (gclient)
+        id: cache-engine
+        uses: actions/cache@v4
+        with:
+          path: |
+            flutter/engine
+            flutter/.pub-preload-cache
+          key: engine-${{ steps.version.outputs.FLUTTER_VERSION }}-${{ runner.os }}
+          restore-keys: |
+            engine-${{ steps.version.outputs.FLUTTER_VERSION }}-
+
+      # ── 8. Clone Flutter SDK ─────────────────────────────────────────────────
+      - name: Clone Flutter
+        run: |
+          python3 build.py clone \
+            --version="${{ steps.version.outputs.FLUTTER_VERSION }}"
+
+      # ── 9. gclient sync (fetch engine, Dart, deps) ──────────────────────────
+      - name: Sync engine dependencies (gclient)
+        if: steps.cache-engine.outputs.cache-hit != 'true'
+        run: |
+          python3 build.py sync
+
+      # ── 10. Install ARM64 sysroot ────────────────────────────────────────────
+      - name: Install ARM64 sysroot
+        run: |
+          python3 build.py install_sysroot \
+            --arch="${{ github.event.inputs.arch || 'arm64' }}"
+
+      # ── 11. Print disk usage ─────────────────────────────────────────────────
+      - name: Check disk space before build
+        run: df -h
+
+      # ── 12. Configure (GN) ──────────────────────────────────────────────────
+      - name: Configure build (GN)
+        run: |
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          RUNTIMES="${{ github.event.inputs.runtimes || 'debug,release,profile' }}"
+          LTO="${{ github.event.inputs.lto || 'false' }}"
+          python3 build.py configure \
+            --arch="$ARCH" \
+            --runtimes="$RUNTIMES" \
+            --lto="$LTO"
+
+      # ── 13. Build (ninja) ────────────────────────────────────────────────────
+      - name: Build engine + Dart SDK (ninja)
+        run: |
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          RUNTIMES="${{ github.event.inputs.runtimes || 'debug,release,profile' }}"
+          python3 build.py build \
+            --arch="$ARCH" \
+            --runtimes="$RUNTIMES"
+
+      # ── 14. Assemble SDK + fix stamps ────────────────────────────────────────
+      - name: Assemble Flutter SDK and create stamps
+        run: |
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          RUNTIMES="${{ github.event.inputs.runtimes || 'debug,release,profile' }}"
+          python3 build.py assemble \
+            --arch="$ARCH" \
+            --runtimes="$RUNTIMES"
+
+      # ── 15. Package ──────────────────────────────────────────────────────────
+      - name: Package Flutter SDK
+        id: package
+        run: |
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          VERSION="${{ steps.version.outputs.FLUTTER_VERSION }}"
+          python3 build.py package \
+            --arch="$ARCH" \
+            --version="$VERSION"
+          
+          # Export filename for release step
+          PKG_NAME="flutter-${VERSION}-linux-${ARCH}.tar.gz"
+          echo "PACKAGE_NAME=$PKG_NAME" >> $GITHUB_OUTPUT
+
+      # ── 16. Check disk usage after build ────────────────────────────────────
+      - name: Check disk space after build
+        run: df -h
+
+      # ── 17. Upload artifact (for inspection) ────────────────────────────────
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-sdk-${{ steps.version.outputs.FLUTTER_VERSION }}-${{ github.event.inputs.arch || 'arm64' }}
+          path: "*.tar.gz"
+          compression-level: 0
+          retention-days: 7
+
+      # ── 18. Create GitHub release ────────────────────────────────────────────
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "flutter-${{ steps.version.outputs.FLUTTER_VERSION }}-${{ github.event.inputs.arch || 'arm64' }}"
+          name: "Flutter ${{ steps.version.outputs.FLUTTER_VERSION }} (Linux ${{ github.event.inputs.arch || 'arm64' }} / proot)"
+          body: |
+            ## Flutter SDK for proot ARM64
+
+            **Flutter version:** `${{ steps.version.outputs.FLUTTER_VERSION }}`  
+            **Target arch:** `${{ github.event.inputs.arch || 'arm64' }}`  
+            **Runtimes:** `${{ github.event.inputs.runtimes || 'debug,release,profile' }}`
+
+            ### Installation (inside proot)
+
+            ```bash
+            # 1. Extract the SDK
+            tar -xzf ${{ steps.package.outputs.PACKAGE_NAME }} -C /opt
+
+            # 2. Run the install script
+            bash /opt/flutter/flutter-proot-install.sh
+
+            # 3. Add to PATH (add to ~/.bashrc or ~/.zshrc)
+            export PATH="$PATH:/opt/flutter/bin"
+
+            # 4. Verify
+            flutter doctor
+            ```
+
+            > ⚠️ All artifacts are pre-built and stamped — `flutter` will NOT try to re-download anything.
+          files: "*.tar.gz"
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
