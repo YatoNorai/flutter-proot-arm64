@@ -129,9 +129,12 @@ jobs:
 
       # ── 3. System dependencies ───────────────────────────────────────────────
       - name: Install system dependencies
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          sudo -E apt-get update -qq
+          sudo -E apt-get install -y --no-install-recommends \
             git curl wget ca-certificates \
             ninja-build \
             libfreetype-dev \
